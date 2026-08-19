@@ -263,15 +263,14 @@ case runs once (not multiple trials), which trades statistical confidence for
 speed and cost given the project timeline - a documented limitation, not an
 oversight (see REFLECTION.md).
 
-Real runs of this eval found two genuine bugs, not hypothetical ones - a
-guardrail classification inconsistency, and an off-by-one in the tool-use
-round budget (`agent/llm_client.py`'s `MAX_TOOL_ROUNDS`) that could make a
-legitimately multi-step lookup unable to ever finish. Both are fixed, and a
-third bug (a partial tool-call batch getting discarded entirely when the
-model's response was cut off mid-generation) was found from live app usage
-and is now permanently guarded by a new eval case
-(`broad_followup_parallel_tool_calls`). Repeated eval runs afterward
-confirmed 40/40 deterministic checks passing consistently. See
+Real runs of this eval - and one sharp question during review - found four
+genuine bugs, not hypothetical ones: a guardrail classification
+inconsistency, an off-by-one in the tool-use round budget, a partial
+tool-call batch getting discarded entirely on a mid-generation cutoff, and
+row-cap truncation that could silently produce a confidently wrong answer
+for a broad query (e.g. "every county in Texas" - 254 counties). All four
+are fixed and permanently guarded by eval cases. The latest full run
+confirmed 43/43 deterministic checks passing consistently. See
 REFLECTION.md for the full story.
 
 ## Deployment

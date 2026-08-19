@@ -1,5 +1,5 @@
 """Claude tool-use loop: turns one user message into a grounded answer by letting
-the model call query_census_data zero or more times before responding."""
+the model call query_census_data one or more times before responding."""
 
 import json
 

@@ -173,6 +173,26 @@ EVAL_CASES: list[EvalCase] = [
         ],
     ),
     EvalCase(
+        id="row_cap_truncation_awareness",
+        category="dataset_limitation",
+        description=(
+            "Texas has 254 counties - more than agent/tools.py's MAX_ROWS cap - so a "
+            "per-county listing query would come back truncated. The agent must never "
+            "silently present a partial row list as complete data; it should explain "
+            "the limitation and offer an aggregate/narrower alternative instead."
+        ),
+        turns=[
+            Turn(
+                "What is the population of every county in Texas?",
+                checks=[
+                    nonempty_answer(),
+                    mentions_any(["254", "too many", "can't", "cannot", "limit", "narrow"]),
+                    not_mentions_any(["here are the populations"]),  # would imply a silently-partial dump
+                ],
+            ),
+        ],
+    ),
+    EvalCase(
         id="broad_followup_parallel_tool_calls",
         category="reliability",
         description=(

@@ -6,7 +6,12 @@ from dataclasses import dataclass
 import snowflake.connector
 from cryptography.hazmat.primitives import serialization
 
-MAX_ROWS = 200
+# Comfortably covers a full per-county listing for any single US state (Texas has
+# the most, at 254) while still bounding a truly unbounded query (e.g. all ~240k
+# block groups, or all ~3,143 US counties nationwide). The system prompt's rule 3
+# (agent/prompts.py) is the real safeguard beyond this cap - it tells the model to
+# prefer aggregation and to never treat a truncated row list as complete data.
+MAX_ROWS = 300
 STATEMENT_TIMEOUT_SECONDS = 30
 
 _SELECT_RE = re.compile(r"^\s*SELECT\b", re.IGNORECASE)

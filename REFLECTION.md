@@ -107,6 +107,34 @@ structurally could not.
   IP- or session-based rate limiting and a budget alarm on both the
   Anthropic and Snowflake sides.
 
+## Fourth fix: truncated row-listing queries could silently produce wrong answers
+
+Raised directly by a user question during review, not found by the eval or
+smoke tests: `agent/tools.py`'s `MAX_ROWS` cap protects against unbounded
+queries (cost, latency, and even blowing the model's own context window if a
+huge result got fed back into the conversation), but a query that legitimately
+needed more rows than the cap - e.g. "population of every county in Texas"
+(254 counties) - would previously get silently truncated, with nothing
+telling the model the data was incomplete. If the model then computed a total
+or presented the partial list as if it were everything, that's a confident,
+wrong answer - arguably worse than an honest refusal. `QueryResult` already
+carried a `truncated: true/false` flag back to the model, but the system
+prompt never told it what that meant.
+
+Fixed two ways: (1) a new system-prompt rule (`agent/prompts.py`, rule 3)
+telling the model to prefer server-side aggregation (`SUM`/`COUNT`, which
+always returns one complete row no matter how many rows it scanned) over
+listing individual rows, and to treat `truncated: true` as a hard signal
+that it is not looking at complete data - never compute a total from it,
+either rewrite to aggregate or tell the user to narrow the request; (2)
+raised `MAX_ROWS` from 200 to 300, comfortably covering a full per-county
+listing for any single US state (Texas has the most, at 254) while still
+bounding genuinely unbounded queries (nationwide counties or block groups).
+Verified live: "What is the population of every county in Texas?" now
+correctly declines to dump a silently-partial list, explains the 254-county
+limitation, and offers a total, a top-N, or batched retrieval instead. Added
+a permanent eval case (`row_cap_truncation_awareness`) guarding this.
+
 ## Edge cases and failure modes identified but not fully addressed
 
 - **Prompt injection via tool results.** Data returned from Snowflake (e.g. a
@@ -115,13 +143,8 @@ structurally could not.
   reaches the model's context. Low risk here (Marketplace data isn't
   user-writable), but worth naming - the guardrail layers only inspect the
   user's own message, not tool output.
-- **Very large result sets.** `MAX_ROWS = 200` in `agent/tools.py` prevents
-  a single query from flooding the context window, but a question that
-  legitimately needs an aggregate over more rows than that (e.g. "list every
-  county's population") will get a silently truncated answer rather than an
-  explicit "this is too broad, can you narrow it?" message. The `truncated`
-  flag is threaded through but the system prompt doesn't yet instruct the
-  model to react to it explicitly.
+- ~~Very large result sets silently truncated~~ - **fixed**, see "Fourth fix"
+  above.
 - **Vintage/methodology mixing.** The dataset has 2019 and 2020 ACS 5-year
   estimates plus a separate 2020 Redistricting table with actual decennial
   counts (no sampling error, different table shape entirely). The system
