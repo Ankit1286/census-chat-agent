@@ -34,9 +34,10 @@ Beyond that:
 - The long-tail retrieval system is only directly verified on maybe five concepts out of 365. Reasonable spot check, not real coverage.
 - Real token streaming instead of a spinner-then-everything-at-once would feel noticeably better on longer answers.
 - I tried one prompt injection phrasing and it got blocked, but nobody's actually tried to break this deliberately with a few different strategies.
-- The app caches one Snowflake connection per session with no pooling — fine for a demo, wouldn't survive real concurrent traffic.
+- The app caches one Snowflake connection per session with no pooling — fine for a demo, wouldn't survive real concurrent traffic. Need a caching system to cache already searched queries with a TTL to preserve latency budget.
 - Conversation history just grows, capped at 40 messages. A real deployment would want to trim or summarize older turns before that becomes an issue.
 - There's no logging of questions, generated SQL, or latency anywhere right now. For an actual handoff that's the first thing I'd add, so a bad answer is debuggable after the fact instead of only reproducible by luck.
+- Would make the UI better.
 
 ## Edge cases and failure modes identified but not fully addressed
 

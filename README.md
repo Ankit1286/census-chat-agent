@@ -349,18 +349,3 @@ column-listing → data-query chain returned correct, real-time answers -
 including confirming `sentence-transformers`/`torch` (a genuinely heavy
 dependency, ~1-2GB) builds and runs fine within the free tier's limits, a
 risk flagged during development that did not end up materializing.
-
-## Known limitations / not done
-
-See REFLECTION.md for the full list; the headline items are: streaming is
-spinner-based rather than token-by-token, there's no persistent conversation
-storage (history resets on page refresh, by design, for a public
-unauthenticated demo), the automated test suite mocks the LLM rather than
-replaying real recorded API responses, the retrieval system's semantic
-search half has no stemming (a plural/singular mismatch can weaken it), and
-the long-tail retrieval system has only been directly spot-checked on a
-handful of the ~365 possible concepts, not exhaustively tested. The one risk
-flagged earlier that's since been resolved: `sentence-transformers`/`torch`
-(~1-2GB) was a real concern for Streamlit Community Cloud's free-tier build
-limits, but the deployed app has been verified working end to end,
-including a long-tail question exercising that dependency directly.
