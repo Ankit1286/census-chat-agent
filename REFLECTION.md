@@ -2,388 +2,46 @@
 
 ## Development process and key architectural decisions
 
-I used Claude Code throughout: it drafted the architecture options, I picked
-between them (custom tool-use agent vs. Cortex Analyst; Streamlit Community
-Cloud vs. a separate frontend/backend), and it wrote the implementation
-against an explicit plan we agreed on before any code was written.
+I built this with Claude Code from a plan we agreed on before writing any code. The core decision was how to ground answers in the data: a hand-built Claude tool-use agent that writes SQL against Snowflake, not RAG and not Cortex Analyst.
 
-The central decision was **grounding via text-to-SQL tool-use against
-Snowflake, not RAG and not Cortex Analyst**:
-- RAG is built for retrieving relevant *text*; Census questions need exact
-  aggregation/filtering/joins over numeric data, which only a real query
-  engine can compute correctly. RAG would risk returning plausible-looking
-  but wrong numbers.
-- Cortex Analyst was tempting (it's the "intended" Snowflake-native answer),
-  but it's region-gated on trial accounts, and using a managed black box
-  would demonstrate less of the actual agent engineering (prompt design for
-  grounding, a tool-use loop, layered guardrails, graceful degradation) that
-  the rubric says it's scoring. So Snowflake is used purely as the warehouse;
-  the reasoning/guardrail/conversation logic is hand-built.
+RAG doesn't really fit here — Census questions need exact aggregation across rows, and similarity search over text chunks can't compute a SUM. Cortex Analyst was tempting since it's Snowflake's own answer to this exact problem, but it's region-gated on trial accounts (a real risk of losing hours to a region migration), and leaning on a managed black box would show less of the actual engineering the assignment is scoring. So Snowflake is just the warehouse; the reasoning, guardrails, and conversation logic are all mine.
 
-Secondary decisions: a curated, hand-written schema description
-(`agent/schema_context.py`) rather than either hardcoding every column or
-giving the model raw `information_schema` access - a middle ground the
-assignment's own tips pointed at ("context awareness" without requiring
-every column hardcoded). Two independent guardrail layers (a fast
-classifier pre-check, plus system-prompt-level refusal instructions) so a
-failure in one doesn't remove all protection. SQL validation as a structural
-guardrail independent of both the LLM's judgment and the database role's
-permissions - defense in depth against a single point of failure.
+A few other decisions worth calling out:
 
-## Bugs found via live testing (and why they matter)
+- **A curated schema description, not a full data dictionary.** `agent/schema_context.py` hand-documents about a dozen commonly-asked concepts directly. The dataset has ~365 distinct concepts total (some physical tables bundle 400+ columns), so hardcoding everything wasn't realistic.
+- **Streamlit Community Cloud for hosting** — free, deploys straight from GitHub, nothing to manage.
+- **Key-pair auth for the Snowflake connection, not a password.** New trial accounts enforce MFA on password logins, which silently breaks any non-interactive client — including the app itself. Key-pair auth sidesteps that and is Snowflake's own recommended pattern for service accounts anyway.
+- **Two layers of guardrails** — a fast, cheap classifier that rejects obviously off-topic or unsafe messages before the real agent runs, plus the main agent's own instructions as a backup if the classifier misses something.
 
-Once the Snowflake trial account and Marketplace dataset were connected, I
-ran `scripts/smoke_test.py` against the real Claude + Snowflake stack. Three
-real bugs surfaced that no amount of mocked unit testing would have caught,
-which is exactly why the plan called for a manual live smoke test as a
-separate layer from the automated suite:
-
-1. **Case-sensitive, digit-leading SQL identifiers.** The dataset's ACS
-   columns are mixed-case (`B01003e1`, not `B01003E1`) and table names start
-   with a digit (`2020_CBG_B01`). Unquoted, Snowflake either folds the
-   column name to uppercase (→ "invalid identifier") or fails to parse the
-   table reference entirely. The very first golden question - "total
-   population of Travis County" - failed silently (agent gave up after
-   exhausting its tool-call budget) until I traced it with a standalone
-   script and found the connector error. Fix: added an explicit "SQL syntax"
-   section with a worked example query to `agent/schema_context.py`, so the
-   model is told to double-quote these identifiers rather than discovering
-   it by trial and error.
-2. **Empty final answer on a harder question.** "Median household income in
-   Austin, TX" (which requires recognizing Austin isn't a county, running two
-   queries, and computing a labeled approximation) came back as a blank
-   response. Tracing it showed the model's response included a `thinking`
-   content block that consumed the entire `max_tokens=1024` budget before
-   any answer text was generated, so `stop_reason` was `max_tokens` with no
-   text at all - a genuine "queries that are reasonable but the system fails
-   silently" case squarely in the failure modes the assignment asks about.
-   Fixed two ways: raised `max_tokens` to 4096, and added a defensive check
-   in `run_agent_turn` so an empty final answer *always* surfaces as an
-   honest "I ran into trouble" message instead of a blank chat bubble,
-   regardless of why it happened.
-3. **Snowflake's mandatory MFA policy blocks programmatic password auth.**
-   New trial accounts require MFA on password logins, which fails outright
-   for any non-interactive client - the discovery script, and critically,
-   the deployed Streamlit app itself would have hit the same wall in
-   production. Fixed by switching the app's Snowflake connection to
-   key-pair authentication for the dedicated service user (`CENSUS_APP_USER`),
-   which isn't subject to that policy and is Snowflake's own recommended
-   pattern for service accounts regardless.
-
-After these three fixes, the full golden-question set (state/county lookup,
-multi-turn follow-up, ambiguous geography, city-not-a-county, the
-median-aggregation trap, out-of-scope questions, off-topic redirection, and
-a prompt-injection attempt) all produced correct, well-caveated answers -
-see the transcript captured during development. This was, honestly, a good
-reminder that a system prompt built from `DESCRIBE TABLE` output and
-documentation review looks complete right up until it meets a real
-identifier-quoting quirk or a real token-budget edge case - live testing
-against the actual stack found problems the mocked control-flow tests
-structurally could not.
+One thing changed shape mid-build and is worth calling out specifically: the "long-tail" lookup, for concepts outside the curated dozen, started as the model writing raw SQL against the metadata table itself. Live testing showed that was genuinely unreliable — a search for "travel time" got crowded out of the results by an unrelated table purely because of row-limit ordering, and the model had no real way to guess which internal column number held a specific detail like "male, under 5 years old." I rebuilt it as a proper two-stage retrieval system (`retrieval/`): hybrid keyword+semantic search to find the right *concept* first, then a plain, deterministic listing of that concept's columns once it's chosen. It's its own small package now, with its own tests, and it fixed both failures reliably.
 
 ## What I'd improve or do differently with more time
 
-- **True token streaming.** The current UX shows a spinner during the SQL
-  tool-call phase and renders the final answer in one shot. Interleaving
-  real token streaming with tool-use round-trips (stream text, pause to run
-  a tool, resume streaming) is more plumbing than I invested in; it would
-  meaningfully improve perceived latency on longer answers.
-- **Conversation length management.** Message history grows unbounded within
-  a session (capped only by a hard 40-message limit). A real deployment
-  would want to summarize or truncate older turns so very long sessions
-  don't blow the context window or the latency budget.
-- **Geography disambiguation.** Right now, disambiguation (e.g. "Washington"
-  state vs. county) is handled entirely by system-prompt instruction. With
-  more time I'd add a lightweight fuzzy-match lookup against the geography
-  dimension table so the agent can proactively list the candidates
-  ("Did you mean Washington State, or Washington County in one of these 30
-  states?") instead of relying on the model to know that unaided.
-- **Observability.** No logging/tracing of tool calls, guardrail decisions,
-  or latency per turn. For a real handoff I'd add structured logging (at
-  minimum: question, classification, generated SQL, latency, error/success)
-  so a customer's team could debug a bad answer after the fact.
-- **Cost/rate limiting.** The per-session message cap is a token gesture at
-  abuse protection on a public, unauthenticated URL. A real deployment needs
-  IP- or session-based rate limiting and a budget alarm on both the
-  Anthropic and Snowflake sides.
-
-## Fourth fix: truncated row-listing queries could silently produce wrong answers
-
-Raised directly by a user question during review, not found by the eval or
-smoke tests: `agent/tools.py`'s `MAX_ROWS` cap protects against unbounded
-queries (cost, latency, and even blowing the model's own context window if a
-huge result got fed back into the conversation), but a query that legitimately
-needed more rows than the cap - e.g. "population of every county in Texas"
-(254 counties) - would previously get silently truncated, with nothing
-telling the model the data was incomplete. If the model then computed a total
-or presented the partial list as if it were everything, that's a confident,
-wrong answer - arguably worse than an honest refusal. `QueryResult` already
-carried a `truncated: true/false` flag back to the model, but the system
-prompt never told it what that meant.
-
-Fixed two ways: (1) a new system-prompt rule (`agent/prompts.py`, rule 3)
-telling the model to prefer server-side aggregation (`SUM`/`COUNT`, which
-always returns one complete row no matter how many rows it scanned) over
-listing individual rows, and to treat `truncated: true` as a hard signal
-that it is not looking at complete data - never compute a total from it,
-either rewrite to aggregate or tell the user to narrow the request; (2)
-raised `MAX_ROWS` from 200 to 300, comfortably covering a full per-county
-listing for any single US state (Texas has the most, at 254) while still
-bounding genuinely unbounded queries (nationwide counties or block groups).
-Verified live: "What is the population of every county in Texas?" now
-correctly declines to dump a silently-partial list, explains the 254-county
-limitation, and offers a total, a top-N, or batched retrieval instead. Added
-a permanent eval case (`row_cap_truncation_awareness`) guarding this.
-
-## Fifth and sixth fixes: the metadata-lookup fallback was rebuilt entirely
-
-Both found via live tracing during review, prompted by direct skepticism
-about whether the "model writes its own `ILIKE` SQL against the glossary
-table" approach was actually reliable for concepts outside the curated
-headline list - it wasn't, and proving that concretely (rather than assuming
-either way) mattered more than the fix itself.
-
-**Bug 5 - keyword search could silently miss the right table.** Asked to
-find "travel time," the model's `WHERE TABLE_TITLE ILIKE '%travel time%'`
-search genuinely matched the correct table (`B08303`, "Travel Time To
-Work"), but a flat `LIMIT 100` on unranked, per-field rows let a different,
-larger table (`B08134`, hundreds of matching field-level rows) crowd it out
-of the results entirely - re-running the identical query with no `LIMIT`
-confirmed `B08303` was a real match, just never seen. The model only
-recovered because it happened to already know the code `B08303` from
-pretrained knowledge, not because the search worked.
-
-**Bug 6 - no principled way to know which `FIELD_LEVEL` column held a
-detail.** Asked "how many males under 5," the model had to guess which of
-ten `FIELD_LEVEL_N` columns held the age-bracket detail - tried level 3
-(wrong), then level 9 (also wrong, and hit a real typo in the source data,
-`FIELD_LEVELl_9`, along the way), burned its entire 6-round budget, and
-never answered. This is exactly the kind of "queries that partially match
-available data" failure the assignment calls out, and it would have shipped
-invisibly - it only manifests on the specific subset of long-tail questions
-needing a field deeper than the top-level table title describes.
-
-**The fix - and a first attempt at it that also failed.** My first fix
-(TF-IDF + semantic hybrid search, ranked by Reciprocal Rank Fusion, still
-searching individual columns) did not actually work when tested: it fixed
-the missing-bigram problem but introduced a *structural* bias - a concept
-with 98 columns (e.g. "Sex By Age") got 98 chances to appear in a ranked
-top-K list, while a 2-column concept got 2 chances, so column-count alone
-could still crowd out the right answer independent of relevance. Rebuilt as
-a genuine two-stage system instead (`retrieval/`): stage 1 ranks ~365
-*concepts* (one document per `TABLE_NUMBER`, not per column, so every
-concept gets exactly one shot regardless of size); stage 2 is a
-deterministic filter listing every column of the chosen concept (no
-ranking, no guessing a field-level number - just a complete, correct list
-for the model to read). Verified live and via `tests/test_retrieval.py` and
-two new permanent eval cases (`long_tail_commute_time_lookup`,
-`long_tail_field_level_lookup`) - both previously-failing questions now
-answer correctly and consistently (checked 3 times each against the real
-stack). Full eval run afterward: 51/51 deterministic checks.
+- **Real token streaming.** The answer renders in one shot after a spinner right now; interleaving streaming with the tool-use round-trips would feel more responsive on longer answers.
+- **Run the eval suite multiple times, not once.** I found two intermittent bugs this session purely because I happened to re-run something — a guardrail inconsistency and a round-budget issue that only showed up on a second pass. There are probably others I haven't caught yet for the same reason.
+- **Broader coverage of the long-tail retrieval system.** I've only directly verified it on a handful of concepts (veterans, commute time, sex-by-age breakdowns) out of ~365 possible ones. That's a spot check, not real coverage.
+- **Adversarial/red-team testing.** One prompt-injection phrasing was tried and blocked. Someone trying several bypass strategies deliberately hasn't been simulated.
+- **Connection pooling.** The app caches one Snowflake connection per session, fine for the traffic this demo will see, but it wouldn't hold up under real concurrent load.
+- **Conversation length management.** History just grows with a hard 40-message cap. A real deployment would want to summarize or trim older turns.
+- **Basic observability.** No logging of questions, generated SQL, or latency per turn right now — for an actual handoff I'd want that so a bad answer could be debugged after the fact.
 
 ## Edge cases and failure modes identified but not fully addressed
 
-- **Prompt injection via tool results.** Data returned from Snowflake (e.g. a
-  geography name) is passed back into the model as a tool result; if a
-  malicious actor could get injected text into the dataset itself, that text
-  reaches the model's context. Low risk here (Marketplace data isn't
-  user-writable), but worth naming - the guardrail layers only inspect the
-  user's own message, not tool output.
-- ~~Very large result sets silently truncated~~ - **fixed**, see "Fourth fix"
-  above.
-- **Vintage/methodology mixing.** The dataset has 2019 and 2020 ACS 5-year
-  estimates plus a separate 2020 Redistricting table with actual decennial
-  counts (no sampling error, different table shape entirely). The system
-  prompt tells the model to mention which vintage it used, but there's no
-  hard guard against it silently mixing, say, a 2019 income figure with a
-  2020 population figure across two calls in one answer - this would need
-  either explicit year-consistency checking in the tool layer or a stronger
-  prompt instruction to always state and stick to one vintage per answer.
-- ~~Long tail relies on the model's own raw metadata-table SQL~~ - **rebuilt**,
-  see "Fifth and sixth fixes" above. The two-stage retrieval system covers
-  the long tail far more reliably now, but it's still not exhaustively
-  tested across all ~365 concepts - only a handful (veterans, commute time,
-  sex-by-age breakdowns) have been directly verified. There's also a known,
-  smaller gap: plain TF-IDF has no stemming, so a pure plural/singular
-  mismatch ("males" vs. the corpus's "Male") can still weaken the keyword
-  half of the search - concept-level search proved robust to this in
-  practice (the concept title "Sex By Age" doesn't depend on getting
-  "male" vs "males" right), but a column-level search would be more exposed.
-- **`sentence-transformers` adds a genuinely heavy dependency** (`torch`,
-  ~1-2GB) for the retrieval system's semantic-search half, which has not yet
-  been verified against an actual Streamlit Community Cloud deployment - a
-  real risk to the free tier's build limits, documented but not resolved
-  (see README.md's "Known limitations").
-- **Concurrent sessions sharing a Snowflake connection.** `app.py` caches one
-  connection per Streamlit session via `st.session_state`, not a pool. Under
-  concurrent public traffic this could exhaust connections or hold idle
-  connections open; a real deployment should use a connection pool with a
-  sensible max size and idle timeout.
-- **Non-English or malformed input.** Not explicitly tested. The guardrail
-  classifier and main agent should handle it reasonably (Claude is
-  multilingual), but there's no test coverage confirming graceful behavior
-  on, e.g., empty strings, extremely long input, or non-UTF8 content.
+- **Prompt injection through tool results, not just user messages.** If the dataset itself ever contained adversarial text, it would reach the model as a tool result unfiltered. Low risk since Marketplace data isn't user-writable, but the guardrails only look at what the user typed, not at what comes back from Snowflake.
+- **Mixing data vintages in one answer.** The dataset has 2019 and 2020 ACS estimates plus a separate 2020 Redistricting table with a different methodology entirely. The model is told to state which year it used, but nothing actually stops it from silently combining a 2019 figure with a 2020 one across two calls in the same answer.
+- **No stemming in the retrieval system.** A plain plural/singular mismatch (searching "males" against text that says "Male") can weaken the keyword half of the search. It held up fine in testing because concept-level search doesn't usually hinge on getting that one word exactly right, but it's a real gap, not a solved one.
+- **Non-English or malformed input** was never explicitly tested — empty strings, very long input, non-UTF8 text.
+- **No load testing at all**, on an app that's now genuinely public.
 
-## Testing approach and tradeoffs
+## How I approached testing, and what I'd add
 
-Four layers now, each chosen for a different kind of confidence:
+Four layers, each catching something the others structurally can't:
 
-1. **Unit tests** (`test_tools.py`, `test_guardrails.py`) - deterministic,
-   no external dependencies (mocked Snowflake connector, mocked Anthropic
-   client). These validate the parts of the system that are pure logic and
-   should never depend on model behavior: SQL safety validation and
-   guardrail fail-open behavior.
-2. **Control-flow tests** (`test_agent_eval.py`) - a fake Anthropic client
-   simulates specific model behaviors (direct answer, one tool round,
-   Snowflake outage mid-turn, runaway tool-calling, invalid generated SQL)
-   to verify the *loop* handles each correctly. These are not a substitute
-   for evaluating real answer quality - they can't tell you whether the
-   model actually writes correct SQL for a given question - but they run in
-   CI for free and catch regressions in the orchestration code itself.
-3. **Manual smoke test** (`scripts/smoke_test.py`) - a fixed list of golden
-   natural-language questions run against the real Claude + Snowflake stack.
-   Exercises real NL understanding and real generated SQL, but a human has
-   to read the transcript and judge whether each answer is good - not
-   automated, not scored, not repeatable as a pass/fail gate.
-4. **Eval system** (`eval/`) - built specifically to close the gap in #3:
-   the same style of golden questions, but each one now carries automated,
-   deterministic checks (`eval/checks.py` - does the answer contain a number
-   close to a hand-verified true value, was a real query actually made or
-   correctly *not* made, did the guardrail classify it as expected, did it
-   respond within budget), replayed through the *actual* guardrail-then-agent
-   flow `app.py` uses, not a shortcut around it. A small, explicitly
-   **advisory** LLM-as-judge layer (`eval/judge.py`) covers the couple of
-   things a keyword check can't (e.g. "did it explain *why* medians can't be
-   averaged, not just assert that they can't") - reported separately, never
-   counted toward the authoritative total, because an LLM judging an LLM
-   isn't ground truth. Deliberately **not** wired into CI (real API/warehouse
-   cost) and runs each case once rather than multiple trials (trades
-   statistical confidence for speed given the timeline) - documented
-   limitations, not oversights.
+1. **Unit tests** for the pure logic — SQL safety validation, guardrail fail-open behavior. No AI, no database, just checking our own code does what it should.
+2. **Control-flow tests** that simulate the model with a scripted fake, so the tool-use loop's handling of retries, errors, and edge cases can be checked deterministically and for free.
+3. **A manual smoke test** against the real Claude + Snowflake stack — this is how the first real bugs turned up (case-sensitive column names, an empty-answer bug, an MFA login wall), none of which the mocked tests could have found.
+4. **An automated eval system** that replays the same kind of real questions but scores them automatically instead of me reading transcripts — mostly plain deterministic checks (does the answer contain the right number, was the database actually queried, did the guardrail classify it correctly), plus a small advisory LLM-judge layer for the couple of things a keyword check can't capture.
 
-**The eval earned its keep on the first real run, and the fix was verified
-with a second run.** 32/33 deterministic checks passed on the first run,
-and `crime_rate_out_of_scope` failed - not because the main agent handles it
-badly (it doesn't; earlier manual smoke testing showed a good answer), but
-because **the fast guardrail classifier was inconsistent on this specific
-borderline case.** "What was the crime rate in Travis County in 2020?"
-names a real, in-scope place, so on some runs the classifier correctly
-passed it through to the main agent (which explains the limitation well),
-and on other runs it pre-emptively rejected the whole message as OFF_TOPIC,
-giving a more generic redirect instead of the better, topic-specific
-explanation. This only showed up because the eval runs through the *real*
-guardrail-first path - `smoke_test.py` calls the main agent directly and
-skips the guardrail entirely, so it structurally could not have caught
-this. Root cause: `GUARDRAIL_PROMPT` (`agent/prompts.py`) blurred two
-different jobs together - "is this about US population/places at all"
-(the classifier's actual job) versus "does this dataset have that specific
-metric" (the main agent's job, which it already does well). A fast
-classifier without explicit guidance reasonably struggled on a question
-that sounds like it's asking about data availability. Fix: rewrote the
-prompt to state explicitly that topic-scoping and data-availability are
-different questions, and added the failing case itself as a worked
-few-shot example. Re-running the full eval afterward confirmed **33/33
-deterministic checks passing**, with no regressions on the off-topic or
-injection cases. This is a clean example of eval-driven debugging: found
-by a scored, repeatable check (not a vibe), root-caused precisely, fixed
-with a targeted prompt change, and the fix was *proven* rather than assumed
-by re-running the same eval.
+That eval system earned its keep. Across the session it — plus some direct live tracing — found six real bugs: a guardrail that inconsistently rejected valid borderline questions, an off-by-one in the tool-call round budget that made certain questions literally unable to finish, a batch of tool calls getting thrown away because one of them got cut off mid-generation, silent truncation on broad queries, and the two retrieval failures that led to the two-stage rebuild described above. Every one of them has a regression test now.
 
-Also worth noting honestly: the one advisory judge check that failed (on
-the Texas median-income case) wanted a deeper statistical explanation than
-the answer gave, even after the fix - left as-is deliberately, since it's a
-good illustration of why judge results are advisory rather than
-authoritative; that bar may be stricter than what's actually needed for a
-good user-facing answer, and "chasing" an AI judge's pickiness isn't
-obviously worth trading away a natural-sounding response.
-
-**A second run, immediately after fixing the first bug, found a second, more
-interesting one** - directly validating the value of re-running rather than
-trusting one green pass. `long_tail_veteran_lookup` failed: 4 tool calls
-were made, then the agent gave up with "I wasn't able to find a reliable
-answer." Root cause was an off-by-one in `agent/llm_client.py`'s
-`run_agent_turn`: each loop iteration is one model call, so a task needing
-N tool calls needs N+1 rounds total (N to gather data, one more for the
-model to read the last tool's results and actually write the answer). The
-round budget (`MAX_TOOL_ROUNDS`) was set to exactly 4, so any question
-whose lookup genuinely needed all 4 tool calls could *never* finish - the
-final answering round was simply never budgeted for. This is a real design
-bug that could have shipped invisibly: it only manifests on questions
-needing the full multi-step lookup path (a glossary query, a geography
-lookup, a data query, sometimes a retry), which is exactly the kind of
-"long-tail concept not in the curated cheat-sheet" case this eval was
-specifically built to exercise. Fixed by raising the budget to 6 (headroom
-for the same worst-case lookup plus one true answering round), re-verified
-with two more full eval runs afterward (33/33 both times).
-
-**A third bug turned up from real usage, not from the automated test suites at
-all.** While testing the deployed app, a broad follow-up question ("what else
-can you tell me about Santa Clara County?") occasionally returned a generic
-"I ran into trouble" instead of an answer. Tracing it with a standalone script
-showed the model reasonably trying to fire off several independent lookups in
-parallel in one turn (race, Hispanic origin, employment, education - none
-depend on each other, so batching them is a legitimate efficiency choice, not
-a mistake) - but writing out that many SQL queries plus explanations
-sometimes exceeded the `max_tokens` budget for that single response, cutting
-off mid-generation of the last tool call. The bug: `run_agent_turn` in
-`agent/llm_client.py` decided whether to execute tool calls based on
-`response.stop_reason == "tool_use"` alone - and a truncated response comes
-back with `stop_reason == "max_tokens"` instead, even though most of its tool
-calls were perfectly well-formed. The old code discarded the *entire* batch
-(several good queries along with the one bad one) rather than running what it
-could. Fixed by changing the condition to check for the actual presence of
-tool_use blocks in the response, independent of the exact stop_reason -
-`_execute_tool` already turned a missing/empty SQL into a graceful rejection
-message rather than crashing, so a truncated block now degrades safely
-without losing its well-formed siblings. Added a regression test
-(`test_partial_tool_calls_still_execute_on_max_tokens_cutoff`) simulating
-exactly this mixed-batch scenario, and re-verified against the real stack -
-the same question that used to intermittently fail now reliably returns a
-complete, multi-fact answer. This is the one bug in the whole project that
-neither the mocked tests nor the eval/smoke-test golden questions were
-designed to catch, because none of them happened to ask a broad enough
-follow-up to trigger multi-call batching - a reminder that a curated golden
-set, however good, is still a sample, not a guarantee.
-
-**What I'd add with more time:** run each eval case multiple times
-automatically (not just manually re-running a few times, as done above) to
-get a pass *rate* instead of a single pass/fail per case, since LLM outputs
-aren't fully deterministic - both bugs above were only visible because they
-were intermittent, and a single lucky run of either could have hidden them;
-add a small set of adversarial/red-team prompts specifically targeting the
-guardrail classifier (more paraphrases of "ignore your instructions,"
-indirect injection via a question that quotes suspicious text); and add an
-eval case that deliberately forces a 5-6 round lookup to directly guard the
-round-budget fix above, rather than relying on the veteran-lookup case to
-incidentally exercise it. Load/performance testing (concurrent sessions,
-sustained traffic) remains explicitly out of scope for this submission.
-
-## Honest state of this submission
-
-Done and verified against the real stack: Snowflake trial account created,
-US Open Census Data Marketplace dataset added, real schema discovered and
-integrated into `agent/schema_context.py`, a least-privilege service user
-created with key-pair auth (working around the account's mandatory-MFA
-policy), and the full golden-question smoke test run successfully end to
-end - including the harder edge cases (ambiguous geography, city-not-a-county,
-the median-aggregation trap, out-of-scope questions, off-topic redirection,
-and a prompt-injection attempt). Also done: a full rebuild of the long-tail
-concept lookup into a two-stage hybrid retrieval system (`retrieval/`),
-after live testing showed the original raw-SQL approach was genuinely
-unreliable. Six real bugs total were found and fixed this way across the
-session (see the numbered "fix" sections above) that the mocked automated
-tests could not have caught on their own.
-
-**Not yet done:** deployment to Streamlit Community Cloud itself, and a
-smoke test run against that deployed URL rather than a local connection
-(the assignment's own "Deployment Truth" tip - local doesn't count). This
-is now the single highest-priority remaining item, and carries a real,
-specific risk worth calling out again here: the retrieval system's
-`sentence-transformers`/`torch` dependency (~1-2GB) has not been verified
-against the Streamlit Community Cloud free tier's build limits - if it
-fails to build, the documented fallback is dropping to TF-IDF-only search
-(still fixes both retrieval bugs on its own) rather than let it block
-submission.
-**`<TODO>`: once deployed, fill in the live-demo URL at the top of README.md
-and record here that the smoke test was re-run successfully against the
-deployed environment before final submission.**
+What I'd add: multiple trials per eval case to get a real pass rate instead of a single snapshot, since I already know some of these bugs are intermittent; a wider sample of long-tail concepts instead of the handful I've checked; deliberate adversarial cases; and running the eval directly against the deployed app instead of a local connection, since the two environments aren't guaranteed to behave identically.

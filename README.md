@@ -5,7 +5,7 @@ demographics, grounded in the **US Open Census Data (Neighborhood Insights
 Free Dataset)** — SafeGraph's free Census dataset — available on the
 Snowflake Marketplace.
 
-**Live demo:** `<TODO: fill in Streamlit Community Cloud URL after deployment>`
+**Live demo:** https://census-chat-agent-tynzhdcby2r6qerbv5kybc.streamlit.app/
 **Access:** public, no login required.
 
 ## Architecture
