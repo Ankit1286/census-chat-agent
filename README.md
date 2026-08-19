@@ -21,15 +21,20 @@ Streamlit app (app.py) -- session state holds chat history
    |     off-topic/unsafe -> canned reply, no further calls-----+
    |
    |--2. Agent tool-use loop (agent/llm_client.py)
-   |     Claude (Sonnet) with one tool: query_census_data(sql, reasoning)
+   |     Claude (Sonnet) with three tools:
+   |       query_census_data(sql, reasoning)          - real data query
+   |       search_census_concepts(query)               - stage 1 concept lookup
+   |       list_concept_columns(table_number, year)      - stage 2 column listing
    |     system prompt = curated schema description (agent/schema_context.py)
    |     + rules for ambiguity, out-of-scope questions, and refusing to guess
    |
    v
-Snowflake (agent/tools.py)
-   - validates generated SQL is a single SELECT with a LIMIT (agent/tools.py)
-   - executes via key-pair auth against a read-only service role/warehouse
-   - US Open Census Data (Snowflake Marketplace share)
+Snowflake (agent/tools.py)          Local retrieval index (retrieval/)
+   - validates SQL is a single         - hybrid (TF-IDF + semantic) search
+     SELECT with a LIMIT                 over ~365 pre-built concept docs
+   - executes via key-pair auth        - deterministic column listing once
+     against a read-only role            a concept is chosen
+   - US Open Census Data (Marketplace share)
 ```
 
 **Why this shape, not RAG or Cortex Analyst:**
@@ -75,11 +80,15 @@ is in `agent/schema_context.py`; the highlights that shaped the design:
 ```
 app.py                     Streamlit entrypoint: chat UI, session state, error handling
 agent/
-  llm_client.py             Claude tool-use loop (multi-turn)
+  llm_client.py             Claude tool-use loop (multi-turn, 3 tools)
   tools.py                  SQL validation + Snowflake execution (key-pair auth)
   guardrails.py              Fast on-topic/off-topic/unsafe pre-check
   prompts.py                  System prompt + guardrail prompt templates
   schema_context.py            Curated data dictionary fed into the system prompt
+retrieval/                    Two-stage hybrid search for concepts outside the curated list
+  build_corpus.py               Offline, one-time: builds the corpus + TF-IDF/embedding indexes
+  search.py                      Query-time: search_concepts(), list_columns_for_concept()
+  data/                           Committed artifacts (parquet/pickle/npy, tens of MB)
 snowflake/
   setup.sql                    Read-only service role/user/warehouse (key-pair auth) for the app
   explore_schema.sql           Discovery queries used to map the real dataset schema
@@ -94,14 +103,34 @@ scripts/
 `agent/schema_context.py` holds a curated, human-written description of the
 real Census tables (naming convention, headline metric-to-column mappings,
 geography/aggregation/SQL-syntax rules) that's rendered into the system
-prompt. This is a deliberate middle ground between hardcoding every one of
-the ~150 ACS table families' columns (infeasible - some single tables have
-400+ columns) and giving the model raw `information_schema` access to
-introspect everything itself (slower, and easy to get lost in). For
-anything not in the curated "headline metrics" list, the model is told to
-query `<YEAR>_METADATA_CBG_FIELD_DESCRIPTIONS` itself (it's just another
-table) to resolve a concept to the right column - a "RAG over the schema,
-not the data" pattern rather than hardcoding everything.
+prompt. This covers ~12 of the most commonly-asked-about concepts directly -
+a deliberate middle ground between hardcoding every one of the ~365 distinct
+ACS concepts (infeasible - some single physical tables bundle 400+ columns
+across dozens of concepts) and giving the model raw `information_schema`
+access to introspect everything itself (slower, easy to get lost in).
+
+**For anything not in that curated list**, a dedicated two-stage retrieval
+system (`retrieval/`) takes over, via two extra tools:
+
+1. **`search_census_concepts(query)`** - hybrid (keyword + semantic) search
+   over ~365 pre-built *concept*-level documents (one per `TABLE_NUMBER`,
+   built offline by `retrieval/build_corpus.py`), combined via Reciprocal
+   Rank Fusion. Returns a handful of ranked candidate concepts for the model
+   to judge against the actual question.
+2. **`list_concept_columns(table_number, year)`** - once a concept is
+   chosen, no search is needed: a deterministic filter returns *every*
+   column that concept has, so the model picks the exact one matching the
+   question's specific detail (e.g. "Male" + "Under 5 years") from a
+   complete, guaranteed-correct list rather than guessing a column number.
+
+This replaced an earlier, simpler approach (the model writing raw
+`WHERE TABLE_TITLE ILIKE '%...%'` SQL against the metadata table directly)
+after live testing found it genuinely unreliable - see REFLECTION.md for
+the two specific bugs that motivated the rebuild and the failed first
+attempt at fixing it (flat column-level ranking, which had its own bias:
+a concept with 98 columns got 98 chances to appear in a ranked list, a
+2-column concept got 2 chances, before the fix separated concept-ranking
+from column-listing into two stages).
 
 ## Guardrails
 
@@ -212,6 +241,11 @@ pytest tests/ -v
   max-rounds giveup, invalid-SQL-reported-to-model, empty-final-text
   fallback) against a **fake** Anthropic client, so these are deterministic
   and run in CI (`.github/workflows/tests.yml`) with no API/warehouse cost.
+- `tests/test_retrieval.py` - the two-stage concept/column search
+  (`retrieval/search.py`) against the real, committed corpus artifacts
+  (static offline-built data, no Snowflake/API calls needed) - regression
+  tests for both real bugs this system fixes (concept crowding, field-level
+  guessing), plus shape/filtering checks on `list_columns_for_concept`.
 - `scripts/smoke_test.py` - **not** part of the automated suite. Golden
   natural-language scenarios (straightforward lookup, multi-turn follow-up,
   ambiguous geography, city-not-a-county, median-aggregation trap,
@@ -250,10 +284,11 @@ python -m eval.run_eval
   separately in the scorecard and never counted into the authoritative
   pass/fail total - an LLM judging an LLM is not ground truth.
 - `eval/cases.py` - the golden set: the same scenarios validated via
-  `smoke_test.py`, now with checks attached, plus one new case ("how many
-  veterans live in Travis County") that specifically exercises the
-  metadata-lookup fallback for a concept outside the curated headline
-  metrics list.
+  `smoke_test.py`, now with checks attached, plus three cases exercising the
+  long-tail retrieval fallback for concepts outside the curated headline
+  metrics list ("veterans," "commute time," "males under 5 years old" - the
+  latter two are permanent regression guards for real bugs found live, see
+  REFLECTION.md).
 - `eval/run_eval.py` - runs every case, prints a console scorecard, and
   writes a timestamped report to `eval_results/`.
 
@@ -263,14 +298,20 @@ case runs once (not multiple trials), which trades statistical confidence for
 speed and cost given the project timeline - a documented limitation, not an
 oversight (see REFLECTION.md).
 
-Real runs of this eval - and one sharp question during review - found four
+Real runs of this eval - and sharp questions during review - found six
 genuine bugs, not hypothetical ones: a guardrail classification
 inconsistency, an off-by-one in the tool-use round budget, a partial
-tool-call batch getting discarded entirely on a mid-generation cutoff, and
+tool-call batch getting discarded entirely on a mid-generation cutoff,
 row-cap truncation that could silently produce a confidently wrong answer
-for a broad query (e.g. "every county in Texas" - 254 counties). All four
-are fixed and permanently guarded by eval cases. The latest full run
-confirmed 43/43 deterministic checks passing consistently. See
+for a broad query (e.g. "every county in Texas" - 254 counties), and two
+found while live-tracing the long-tail concept lookup: a keyword search
+that could silently miss the right table (crowded out by a larger, wrong
+one behind a row limit), and a model forced to guess an internal column
+number with no principled way to know it, which burned its whole round
+budget without ever answering. The last two motivated replacing that
+lookup entirely with the two-stage retrieval system described above. All
+six are fixed and permanently guarded by eval cases. The latest full run
+confirmed 51/51 deterministic checks passing consistently. See
 REFLECTION.md for the full story.
 
 ## Deployment
@@ -288,5 +329,12 @@ Deployed on Streamlit Community Cloud:
 See REFLECTION.md for the full list; the headline items are: streaming is
 spinner-based rather than token-by-token, there's no persistent conversation
 storage (history resets on page refresh, by design, for a public
-unauthenticated demo), and the automated test suite mocks the LLM rather
-than replaying real recorded API responses.
+unauthenticated demo), the automated test suite mocks the LLM rather than
+replaying real recorded API responses, and `sentence-transformers` (used by
+the retrieval system's semantic search half) pulls in `torch` - a genuinely
+heavy dependency (~1-2GB) that is a real risk for Streamlit Community
+Cloud's free-tier build limits and has **not yet been verified against an
+actual deployment**. If the free tier can't handle it, the documented
+fallback is dropping the semantic half and keeping TF-IDF-only search,
+which still fixes both concept-lookup bugs on its own (verified separately
+during development).

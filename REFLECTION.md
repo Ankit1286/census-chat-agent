@@ -135,6 +135,52 @@ correctly declines to dump a silently-partial list, explains the 254-county
 limitation, and offers a total, a top-N, or batched retrieval instead. Added
 a permanent eval case (`row_cap_truncation_awareness`) guarding this.
 
+## Fifth and sixth fixes: the metadata-lookup fallback was rebuilt entirely
+
+Both found via live tracing during review, prompted by direct skepticism
+about whether the "model writes its own `ILIKE` SQL against the glossary
+table" approach was actually reliable for concepts outside the curated
+headline list - it wasn't, and proving that concretely (rather than assuming
+either way) mattered more than the fix itself.
+
+**Bug 5 - keyword search could silently miss the right table.** Asked to
+find "travel time," the model's `WHERE TABLE_TITLE ILIKE '%travel time%'`
+search genuinely matched the correct table (`B08303`, "Travel Time To
+Work"), but a flat `LIMIT 100` on unranked, per-field rows let a different,
+larger table (`B08134`, hundreds of matching field-level rows) crowd it out
+of the results entirely - re-running the identical query with no `LIMIT`
+confirmed `B08303` was a real match, just never seen. The model only
+recovered because it happened to already know the code `B08303` from
+pretrained knowledge, not because the search worked.
+
+**Bug 6 - no principled way to know which `FIELD_LEVEL` column held a
+detail.** Asked "how many males under 5," the model had to guess which of
+ten `FIELD_LEVEL_N` columns held the age-bracket detail - tried level 3
+(wrong), then level 9 (also wrong, and hit a real typo in the source data,
+`FIELD_LEVELl_9`, along the way), burned its entire 6-round budget, and
+never answered. This is exactly the kind of "queries that partially match
+available data" failure the assignment calls out, and it would have shipped
+invisibly - it only manifests on the specific subset of long-tail questions
+needing a field deeper than the top-level table title describes.
+
+**The fix - and a first attempt at it that also failed.** My first fix
+(TF-IDF + semantic hybrid search, ranked by Reciprocal Rank Fusion, still
+searching individual columns) did not actually work when tested: it fixed
+the missing-bigram problem but introduced a *structural* bias - a concept
+with 98 columns (e.g. "Sex By Age") got 98 chances to appear in a ranked
+top-K list, while a 2-column concept got 2 chances, so column-count alone
+could still crowd out the right answer independent of relevance. Rebuilt as
+a genuine two-stage system instead (`retrieval/`): stage 1 ranks ~365
+*concepts* (one document per `TABLE_NUMBER`, not per column, so every
+concept gets exactly one shot regardless of size); stage 2 is a
+deterministic filter listing every column of the chosen concept (no
+ranking, no guessing a field-level number - just a complete, correct list
+for the model to read). Verified live and via `tests/test_retrieval.py` and
+two new permanent eval cases (`long_tail_commute_time_lookup`,
+`long_tail_field_level_lookup`) - both previously-failing questions now
+answer correctly and consistently (checked 3 times each against the real
+stack). Full eval run afterward: 51/51 deterministic checks.
+
 ## Edge cases and failure modes identified but not fully addressed
 
 - **Prompt injection via tool results.** Data returned from Snowflake (e.g. a
@@ -153,13 +199,21 @@ a permanent eval case (`row_cap_truncation_awareness`) guarding this.
   2020 population figure across two calls in one answer - this would need
   either explicit year-consistency checking in the tool layer or a stronger
   prompt instruction to always state and stick to one vintage per answer.
-- **Only "headline metrics" are curated; the long tail relies on the model's
-  own metadata lookup.** `schema_context.py` covers ~12 common concepts
-  (population, income, race, education, etc.) explicitly; anything else
-  (e.g. veteran status, internet access, commute time) depends on the model
-  correctly querying `METADATA_CBG_FIELD_DESCRIPTIONS` itself. This worked
-  in every case I tried, but I did not exhaustively test the ~140 ACS table
-  families outside the headline list.
+- ~~Long tail relies on the model's own raw metadata-table SQL~~ - **rebuilt**,
+  see "Fifth and sixth fixes" above. The two-stage retrieval system covers
+  the long tail far more reliably now, but it's still not exhaustively
+  tested across all ~365 concepts - only a handful (veterans, commute time,
+  sex-by-age breakdowns) have been directly verified. There's also a known,
+  smaller gap: plain TF-IDF has no stemming, so a pure plural/singular
+  mismatch ("males" vs. the corpus's "Male") can still weaken the keyword
+  half of the search - concept-level search proved robust to this in
+  practice (the concept title "Sex By Age" doesn't depend on getting
+  "male" vs "males" right), but a column-level search would be more exposed.
+- **`sentence-transformers` adds a genuinely heavy dependency** (`torch`,
+  ~1-2GB) for the retrieval system's semantic-search half, which has not yet
+  been verified against an actual Streamlit Community Cloud deployment - a
+  real risk to the free tier's build limits, documented but not resolved
+  (see README.md's "Known limitations").
 - **Concurrent sessions sharing a Snowflake connection.** `app.py` caches one
   connection per Streamlit session via `st.session_state`, not a pool. Under
   concurrent public traffic this could exhaust connections or hold idle
@@ -313,13 +367,23 @@ created with key-pair auth (working around the account's mandatory-MFA
 policy), and the full golden-question smoke test run successfully end to
 end - including the harder edge cases (ambiguous geography, city-not-a-county,
 the median-aggregation trap, out-of-scope questions, off-topic redirection,
-and a prompt-injection attempt). Three real bugs were found and fixed this
-way (see "Bugs found via live testing" above) that the mocked automated
-tests could not have caught.
+and a prompt-injection attempt). Also done: a full rebuild of the long-tail
+concept lookup into a two-stage hybrid retrieval system (`retrieval/`),
+after live testing showed the original raw-SQL approach was genuinely
+unreliable. Six real bugs total were found and fixed this way across the
+session (see the numbered "fix" sections above) that the mocked automated
+tests could not have caught on their own.
 
 **Not yet done:** deployment to Streamlit Community Cloud itself, and a
 smoke test run against that deployed URL rather than a local connection
-(the assignment's own "Deployment Truth" tip - local doesn't count).
+(the assignment's own "Deployment Truth" tip - local doesn't count). This
+is now the single highest-priority remaining item, and carries a real,
+specific risk worth calling out again here: the retrieval system's
+`sentence-transformers`/`torch` dependency (~1-2GB) has not been verified
+against the Streamlit Community Cloud free tier's build limits - if it
+fails to build, the documented fallback is dropping to TF-IDF-only search
+(still fixes both retrieval bugs on its own) rather than let it block
+submission.
 **`<TODO>`: once deployed, fill in the live-demo URL at the top of README.md
 and record here that the smoke test was re-run successfully against the
 deployed environment before final submission.**

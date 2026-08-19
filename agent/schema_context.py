@@ -42,7 +42,7 @@ HEADLINE_METRICS: list[HeadlineMetric] = [
     HeadlineMetric(
         "Population by sex and age breakdown", "B01", "B01001e1..B01001e49",
         "B01001m1..B01001m49",
-        notes="Field 1 = total; look up exact field via METADATA_CBG_FIELD_DESCRIPTIONS for a specific age/sex bracket.",
+        notes="Field 1 = total; use list_concept_columns('B01001', year) for a specific age/sex bracket.",
     ),
     HeadlineMetric(
         "Race", "B02", "B02001e1..e8", "B02001m1..m8",
@@ -73,7 +73,7 @@ HEADLINE_METRICS: list[HeadlineMetric] = [
         notes="e1=total, e2=in labor force, e3=civilian labor force, e4=employed, e5=unemployed, e7=not in labor force.",
     ),
     HeadlineMetric("Poverty status", "B17", "B17010e1... (family type x age of children)", None,
-                    notes="Multiple related B17xxx tables; look up the exact breakdown via METADATA_CBG_FIELD_DESCRIPTIONS."),
+                    notes="Multiple related B17xxx tables; use search_census_concepts('poverty') to find the right one."),
 ]
 
 GEOGRAPHY_NOTES = """
@@ -150,13 +150,21 @@ def render_schema_context() -> str:
 (ACS 5-year estimates), plus 2020_REDISTRICTING_* (actual 2020 decennial counts, different table shape).
 
 Table naming convention: <YEAR>_CBG_<FAMILY> holds one row per Census Block Group and columns named \
-<TABLE_ID>e<n> (estimate) / <TABLE_ID>m<n> (margin of error) for each ACS field n in that family. \
-<YEAR>_METADATA_CBG_FIELD_DESCRIPTIONS maps every column name to a human-readable description \
-(TABLE_TITLE, FIELD_LEVEL_1..10) - query it (e.g. WHERE TABLE_TITLE ILIKE '%...%' or FIELD_LEVEL_2 \
-ILIKE '%...%') to find the right column for any concept not in the headline list below.
+<TABLE_ID>e<n> (estimate) / <TABLE_ID>m<n> (margin of error) for each ACS field n in that family.
 
 Headline metrics (most questions map to one of these):
 {metrics}
+
+For any concept NOT in that list, do NOT try to guess a column code or hand-write SQL against the \
+metadata table - use the two dedicated lookup tools instead, in order:
+1. search_census_concepts(query) - finds the right high-level CONCEPT (e.g. "Sex By Age", "Travel \
+Time To Work") from a plain-English description. Returns several ranked candidates - read their \
+titles/descriptions and judge which one actually matches the question (e.g. prefer "Travel Time To \
+Work" over "Allocation Of Travel Time To Work" - "Allocation Of ..." tables are data-quality flags, \
+not the actual measurement) rather than blindly taking the first result.
+2. list_concept_columns(table_number, year) - once you've picked a concept, lists every column it \
+contains so you can pick the exact one matching the question's specific detail (e.g. "Male" + \
+"Under 5 years") before using that column code in query_census_data.
 
 Geography:{GEOGRAPHY_NOTES}
 Aggregation rules (important - violating these produces misleading numbers):{AGGREGATION_RULES}

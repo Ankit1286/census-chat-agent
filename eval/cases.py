@@ -220,6 +220,49 @@ EVAL_CASES: list[EvalCase] = [
         ],
     ),
     EvalCase(
+        id="long_tail_commute_time_lookup",
+        category="long_tail_lookup",
+        description=(
+            "Regression guard for a real, reproducible bug found via live testing: the old "
+            "flat ILIKE-based glossary search never surfaced B08303 ('Travel Time To Work') for "
+            "this exact query - a LIMIT crowded it out behind a larger, wrong table. Fixed by the "
+            "two-stage concept/column retrieval system (retrieval/search.py) - see REFLECTION.md."
+        ),
+        turns=[
+            Turn(
+                "How many people in Travis County, TX commute more than an hour to work?",
+                checks=[
+                    nonempty_answer(),
+                    tool_was_called(min_calls=2),  # expect a concept search + a data query
+                    contains_number_near(35_543, tolerance=0.05),
+                    within_latency(60),
+                ],
+            ),
+        ],
+    ),
+    EvalCase(
+        id="long_tail_field_level_lookup",
+        category="long_tail_lookup",
+        description=(
+            "Regression guard for a real, reproducible bug found via live testing: the model had "
+            "to guess which FIELD_LEVEL column number held this age/sex detail (tried level 3, "
+            "then 9 - both wrong; the real answer is at level 6) and exhausted the round budget "
+            "without ever answering. Fixed by list_concept_columns returning the complete, correct "
+            "column list deterministically instead of requiring a level-number guess."
+        ),
+        turns=[
+            Turn(
+                "How many males under 5 years old live in Travis County, TX?",
+                checks=[
+                    nonempty_answer(),
+                    tool_was_called(min_calls=2),
+                    contains_number_near(39_799, tolerance=0.05),
+                    within_latency(60),
+                ],
+            ),
+        ],
+    ),
+    EvalCase(
         id="long_tail_veteran_lookup",
         category="long_tail_lookup",
         description=(
