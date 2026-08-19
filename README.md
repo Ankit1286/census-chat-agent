@@ -209,8 +209,10 @@ deployment.
 
 The 60-second budget is met by: showing a spinner during the SQL tool-call
 phase (`st.status("Querying Census data...")`), capping the tool-use loop at
-4 rounds, and a 30-second Snowflake statement timeout. Live-tested questions
-(including ones requiring two SQL round-trips) completed in a few seconds
+6 rounds (raised from an original 4 after finding an off-by-one - see
+REFLECTION.md), and a 30-second Snowflake statement timeout. Live-tested
+questions, including long-tail lookups needing a concept search plus a
+column listing plus the real data query, completed in well under 30 seconds
 each. **Simplification made under time pressure:** the final answer is
 rendered in one shot rather than token-streamed - true streaming interleaved
 with tool-use calls is more plumbing than the time budget allowed; the
@@ -327,13 +329,26 @@ REFLECTION.md for the full story.
 
 ## Deployment
 
-Deployed on Streamlit Community Cloud:
-1. Push this repo to GitHub.
+Live on Streamlit Community Cloud at the URL at the top of this file. To
+redeploy or fork:
+1. Push this repo to GitHub (private repos work fine - Streamlit's GitHub
+   App needs explicit access granted to see a private repo, under
+   github.com/settings/installations, not just a regular sign-in).
 2. Create a new Streamlit Community Cloud app pointing at `app.py`.
 3. In the app's Secrets settings, paste the contents of a filled-in
    `.streamlit/secrets.toml` (see `.streamlit/secrets.toml.example`) -
    including the PEM private key for key-pair auth.
-4. Verify against the **deployed** URL, not just localhost, before submitting.
+4. Under the app's Sharing settings, make sure it's set to public - by
+   default a newly created app can end up restricted to the deployer's
+   workspace, which looks identical to a broken deploy from the outside
+   (a sign-in wall instead of the chat UI).
+
+Verified against the live URL, not just localhost: both a straightforward
+lookup and a long-tail question requiring the full concept-search →
+column-listing → data-query chain returned correct, real-time answers -
+including confirming `sentence-transformers`/`torch` (a genuinely heavy
+dependency, ~1-2GB) builds and runs fine within the free tier's limits, a
+risk flagged during development that did not end up materializing.
 
 ## Known limitations / not done
 
@@ -341,11 +356,11 @@ See REFLECTION.md for the full list; the headline items are: streaming is
 spinner-based rather than token-by-token, there's no persistent conversation
 storage (history resets on page refresh, by design, for a public
 unauthenticated demo), the automated test suite mocks the LLM rather than
-replaying real recorded API responses, and `sentence-transformers` (used by
-the retrieval system's semantic search half) pulls in `torch` - a genuinely
-heavy dependency (~1-2GB) that is a real risk for Streamlit Community
-Cloud's free-tier build limits and has **not yet been verified against an
-actual deployment**. If the free tier can't handle it, the documented
-fallback is dropping the semantic half and keeping TF-IDF-only search,
-which still fixes both concept-lookup bugs on its own (verified separately
-during development).
+replaying real recorded API responses, the retrieval system's semantic
+search half has no stemming (a plural/singular mismatch can weaken it), and
+the long-tail retrieval system has only been directly spot-checked on a
+handful of the ~365 possible concepts, not exhaustively tested. The one risk
+flagged earlier that's since been resolved: `sentence-transformers`/`torch`
+(~1-2GB) was a real concern for Streamlit Community Cloud's free-tier build
+limits, but the deployed app has been verified working end to end,
+including a long-tail question exercising that dependency directly.
