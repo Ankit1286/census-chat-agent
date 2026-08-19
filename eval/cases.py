@@ -173,6 +173,33 @@ EVAL_CASES: list[EvalCase] = [
         ],
     ),
     EvalCase(
+        id="broad_followup_parallel_tool_calls",
+        category="reliability",
+        description=(
+            "A broad, open-ended follow-up tends to make the model batch several "
+            "independent tool calls (race, income, employment, ...) into one turn - "
+            "which can exceed the response token budget mid-batch and get cut off "
+            "(stop_reason='max_tokens' with a mix of good and truncated tool calls). "
+            "Regression guard for a real bug found from live usage, not from this "
+            "golden set - see REFLECTION.md."
+        ),
+        turns=[
+            Turn(
+                "What was the population of Santa Clara County, CA?",
+                checks=[nonempty_answer(), tool_was_called(), contains_number_near(1_924_379, tolerance=0.03)],
+            ),
+            Turn(
+                "What else can you tell me about Santa Clara County?",
+                checks=[
+                    nonempty_answer(),
+                    tool_was_called(min_calls=2),
+                    not_mentions_any(["wasn't able to find a reliable answer", "ran into trouble"]),
+                    mentions_any(["race", "asian", "white", "hispanic", "employ"]),
+                ],
+            ),
+        ],
+    ),
+    EvalCase(
         id="long_tail_veteran_lookup",
         category="long_tail_lookup",
         description=(

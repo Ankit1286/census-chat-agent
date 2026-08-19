@@ -79,7 +79,17 @@ def run_agent_turn(client, conn, messages: list[dict]) -> tuple[str, list[dict]]
 
         messages.append({"role": "assistant", "content": response.content})
 
-        if response.stop_reason != "tool_use":
+        # Judge by whether there are tool_use blocks to run, not by stop_reason alone.
+        # The model can get cut off mid-turn (stop_reason="max_tokens") while trying to
+        # fire several tool calls at once, leaving some well-formed tool_use blocks
+        # alongside one truncated/empty one. Executing every tool_use block found -
+        # regardless of the exact stop_reason - means the good calls still run instead
+        # of the whole turn being discarded. _execute_tool already turns a missing/empty
+        # "sql" into a graceful rejection message rather than crashing, so a truncated
+        # block degrades safely instead of losing the other, valid results.
+        tool_use_blocks = [b for b in response.content if getattr(b, "type", None) == "tool_use"]
+
+        if not tool_use_blocks:
             text = "".join(block.text for block in response.content if block.type == "text")
             if not text:
                 # Cut off before producing any answer text (e.g. hit max_tokens mid-"thinking"
@@ -92,9 +102,7 @@ def run_agent_turn(client, conn, messages: list[dict]) -> tuple[str, list[dict]]
             return text, messages
 
         tool_results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
+        for block in tool_use_blocks:
             try:
                 output = _execute_tool(conn, block.input)
             except AgentError as exc:

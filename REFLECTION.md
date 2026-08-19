@@ -239,6 +239,35 @@ specifically built to exercise. Fixed by raising the budget to 6 (headroom
 for the same worst-case lookup plus one true answering round), re-verified
 with two more full eval runs afterward (33/33 both times).
 
+**A third bug turned up from real usage, not from the automated test suites at
+all.** While testing the deployed app, a broad follow-up question ("what else
+can you tell me about Santa Clara County?") occasionally returned a generic
+"I ran into trouble" instead of an answer. Tracing it with a standalone script
+showed the model reasonably trying to fire off several independent lookups in
+parallel in one turn (race, Hispanic origin, employment, education - none
+depend on each other, so batching them is a legitimate efficiency choice, not
+a mistake) - but writing out that many SQL queries plus explanations
+sometimes exceeded the `max_tokens` budget for that single response, cutting
+off mid-generation of the last tool call. The bug: `run_agent_turn` in
+`agent/llm_client.py` decided whether to execute tool calls based on
+`response.stop_reason == "tool_use"` alone - and a truncated response comes
+back with `stop_reason == "max_tokens"` instead, even though most of its tool
+calls were perfectly well-formed. The old code discarded the *entire* batch
+(several good queries along with the one bad one) rather than running what it
+could. Fixed by changing the condition to check for the actual presence of
+tool_use blocks in the response, independent of the exact stop_reason -
+`_execute_tool` already turned a missing/empty SQL into a graceful rejection
+message rather than crashing, so a truncated block now degrades safely
+without losing its well-formed siblings. Added a regression test
+(`test_partial_tool_calls_still_execute_on_max_tokens_cutoff`) simulating
+exactly this mixed-batch scenario, and re-verified against the real stack -
+the same question that used to intermittently fail now reliably returns a
+complete, multi-fact answer. This is the one bug in the whole project that
+neither the mocked tests nor the eval/smoke-test golden questions were
+designed to catch, because none of them happened to ask a broad enough
+follow-up to trigger multi-call batching - a reminder that a curated golden
+set, however good, is still a sample, not a guarantee.
+
 **What I'd add with more time:** run each eval case multiple times
 automatically (not just manually re-running a few times, as done above) to
 get a pass *rate* instead of a single pass/fail per case, since LLM outputs

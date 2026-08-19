@@ -266,9 +266,13 @@ oversight (see REFLECTION.md).
 Real runs of this eval found two genuine bugs, not hypothetical ones - a
 guardrail classification inconsistency, and an off-by-one in the tool-use
 round budget (`agent/llm_client.py`'s `MAX_TOOL_ROUNDS`) that could make a
-legitimately multi-step lookup unable to ever finish. Both are fixed;
-repeated eval runs afterward confirmed 33/33 deterministic checks passing
-consistently. See REFLECTION.md for the full story.
+legitimately multi-step lookup unable to ever finish. Both are fixed, and a
+third bug (a partial tool-call batch getting discarded entirely when the
+model's response was cut off mid-generation) was found from live app usage
+and is now permanently guarded by a new eval case
+(`broad_followup_parallel_tool_calls`). Repeated eval runs afterward
+confirmed 40/40 deterministic checks passing consistently. See
+REFLECTION.md for the full story.
 
 ## Deployment
 
