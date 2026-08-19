@@ -8,7 +8,7 @@ RAG doesn't really fit here — Census questions need exact aggregation across r
 
 A few other decisions worth calling out:
 
-- **A curated schema description, not a full data dictionary.** `agent/schema_context.py` hand-documents about a dozen commonly-asked concepts directly. The dataset has ~365 distinct concepts total (some physical tables bundle 400+ columns), so hardcoding everything wasn't realistic.
+- **A curated schema description, not a full data dictionary.** `agent/schema_context.py` hand-documents about a dozen commonly-asked *concepts* directly (a concept is one specific measurement, like "Total Population" - several of them get bundled into one physical Snowflake table, see README for the full breakdown). The dataset has ~365 distinct concepts total, so hardcoding everything wasn't realistic.
 - **Streamlit Community Cloud for hosting** — free, deploys straight from GitHub, nothing to manage.
 - **Key-pair auth for the Snowflake connection, not a password.** New trial accounts enforce MFA on password logins, which silently breaks any non-interactive client — including the app itself. Key-pair auth sidesteps that and is Snowflake's own recommended pattern for service accounts anyway.
 - **Two layers of guardrails** — a fast, cheap classifier that rejects obviously off-topic or unsafe messages before the real agent runs, plus the main agent's own instructions as a backup if the classifier misses something.

@@ -59,6 +59,17 @@ metadata tables mapping cryptic column codes to descriptions and FIPS codes
 to place names. Full detail and the exact grounding text given to the model
 is in `agent/schema_context.py`; the highlights that shaped the design:
 
+One naming wrinkle worth flagging up front, since the term shows up a lot
+below: a physical Snowflake table (e.g. `2020_CBG_B01`) isn't one single
+measurement - it bundles several distinct **concepts** together purely
+because their official Census codes happen to share a prefix (e.g. "Total
+Population" and "Sex By Age" both live in that same physical table). A
+concept, in turn, is made up of individual **columns** - one per specific
+detail, like "male, under 5 years old." So: table → concept → column, each
+one more specific than the last. This distinction is why the long-tail
+lookup (below) has to search for the right *concept* first, rather than
+just the right table.
+
 - **No city/place/ZIP table.** Only state and county (via FIPS) plus raw
   lat/long per block group. "Population of Austin, TX" isn't a clean join
   (Austin isn't a county) - the agent is instructed to say so and offer the
